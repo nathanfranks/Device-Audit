@@ -2759,6 +2759,139 @@ foreach ($ConfigFile in $CompaniesToAudit) {
 		}
 	}
 
+	# Check for devices that look like they should not be under this company
+	if ($DOWrongCompanySearch) {
+		Write-Host "Searching for any devices that look like they belong in a different company..."
+		$MoveDevices = @()
+
+		:matchedDeviceLoop foreach ($Device in $MatchedDevices) {
+			$Hostnames = @()
+			$SCDeviceIDs = @($Device.sc_matches)
+			$RMMDeviceIDs = @($Device.rmm_matches)
+			$SophosDeviceIDs = @($Device.sophos_matches)
+
+			$DeviceType = $false
+			$OperatingSystem = $false
+
+			foreach ($Acronym in $Device_Acronyms) {
+				if ($Device.sc_hostname -like "$($Acronym)-*" -or $Device.rmm_hostname -like "$($Acronym)-*" -or $Device.sophos_hostname -like "$($Acronym)-*") {
+					continue matchedDeviceLoop
+				}
+			}
+
+			if ($SCDeviceIDs) {
+				$SCDevices = @()
+				foreach ($DeviceID in $SCDeviceIDs) {
+					$SCDevices += $SC_DevicesHash[$DeviceID]
+				}			
+				$Hostnames += $SCDevices.Name
+				$OperatingSystem = $SCDevices[0].GuestOperatingSystemName
+				$DeviceType = $SCDevices[0].DeviceType
+			}
+			if ($RMMDeviceIDs) {
+				$RMMDevices = @()
+				foreach ($DeviceID in $RMMDeviceIDs) {
+					$RMMDevices += $RMM_DevicesHash[$DeviceID]
+				}
+				$Hostnames += $RMMDevices."Device Hostname"
+				if (!$OperatingSystem) {
+					$OperatingSystem = $RMMDevices[0]."Operating System"
+				}
+				if ($DeviceType) {
+					$DeviceType = $RMMDevices[0]."Device Type"
+				}
+			}
+			if ($SophosDeviceIDs) {
+				$SophosDevices = @()
+				foreach ($DeviceID in $SophosDeviceIDs) {
+					$SophosDevices += $Sophos_DevicesHash[$DeviceID]
+				}
+				$Hostnames += $SophosDevices.hostname
+				if (!$OperatingSystem) {
+					$OperatingSystem = $SophosDevices[0].OS
+				}
+				if (!$DeviceType) {
+					$DeviceType = $SophosDevices[0].type
+				}
+			}
+			$Hostnames = $HostNames | Sort-Object -Unique
+
+			if (!$DeviceType) {
+				if ($OperatingSystem -and $OperatingSystem -like "*Server*") {
+					$DeviceType = "Server"
+				} else {
+					$DeviceType = "Workstation"
+				}
+			}
+
+			# Ignore Macs
+			if ($OperatingSystem -like "Mac OS*" -or $OperatingSystem -like "macOS*") {
+				continue
+			}
+
+			# Check if the hostname uses this customers acronym
+			$GoodHostname = $false
+			foreach ($Acronym in $Device_Acronyms) {
+				if ((($Hostnames | Where-Object { $_ -like "$($Acronym)-*" }) | Measure-Object).Count -gt 0) {
+					$GoodHostname = $true
+					continue
+				}
+			}
+
+			if (!$GoodHostname -and (($Hostnames | Where-Object { $_ -in $Device_Whitelist }) | Measure-Object).Count -gt 0) {
+				$GoodHostname = $true
+			}
+
+			if ($GoodHostname) {
+				continue
+			}
+
+			# Check for default hostnames and exceptions
+			if ((($Hostnames | Where-Object { $_ -notlike "*-*" -or $_ -like "DESKTOP-*" -or $_ -like "LAPTOP-*" -or $_ -like "*MacBook*" -or  $_ -like "STS-*" }) | Measure-Object).Count -gt 0) {
+				continue
+			}
+
+			# Ignore servers
+			if ($DeviceType -eq "Server") {
+				continue
+			}
+
+			$SCLink = ""
+			$RMMLink = ""
+			$SophosLink = ""
+			if ($SCDeviceIDs) {
+				$SCLink = "$($SCLogin.URL)/Host#Access/All%20Machines/$($SCDevices[0].Name)/$($SCDeviceIDs[0])"
+			}
+			if ($RMMDeviceIDs) {
+				if ($RMMDevices[0].url) {
+					$RMMLink = $RMMDevices[0].url
+				} else {
+					$RMMLink = "https://$($DattoAPIKey.Region).centrastage.net/csm/search?qs=uid%3A$($RMMDeviceIDs[0])"
+				}
+			}
+			if ($SophosDeviceIDs) {
+				$SophosLink = "https://cloud.sophos.com/manage/devices/computers/$($SophosDevices[0].webID)"
+			}
+			$RMMAntivirus = $false
+			if (!$SophosDeviceIDs -and $RMMDeviceIDs) {
+				$RMMAntivirus = $RMMDevices[0].Antivirus
+			}
+
+			# This device does not look like it belongs here, lets flag it
+			$MoveDevices += [PsCustomObject]@{
+				ID = $Device.id
+				Hostnames = $Hostnames -join ', '
+				DeviceType = $DeviceType
+				InSC = if ($SCDeviceIDs) { "Yes" } else { "No" }
+				InRMM = if ($RMMDeviceIDs) { "Yes" } else { "No" }
+				InSophos = if ($SophosDeviceIDs) { "Yes" } elseif ($RMMAntivirus -and $RMMAntivirus -like "Sophos*") { "Yes, missing from portal" } else { "No" }
+				SC_Link = $SCLink
+				RMM_Link = $RMMLink
+				Sophos_Link = $SophosLink
+			}
+		}
+	}
+
 	# Get a count and full list of devices that have been used in the last $InactiveBillingDays for billing
 	if ($DOBillingExport) {
 		Write-Host "Building a device list for billing..."
